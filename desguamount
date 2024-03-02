@@ -1,0 +1,167 @@
+#!/bin/dash
+#
+# by desgua 2020/11/17
+#
+# Dependencies: cryptsetup lvm2 udisks2
+#
+# Run as super user
+#if [ "$USER" != "root" ]; then
+#    sudo "$0" "$@"
+#    exit $?
+#fi
+
+
+# Fancy
+green="\033[01;32m"
+yellow="\033[01;33m"
+red="\033[01;31m"
+white="\033[00;39m"
+whitebold="\033[01;37m"
+
+CHKINST () {
+if [ ! $(command -v "$2") ]; then
+    printf " %-22s $yellow not installed ${white} Install? [y/n]\n" "$2"
+	if [ "$3" ]; then
+		printf " $yellow(%s, actually %s, %s)$white\n" "$2" "$1" "$3"
+	fi
+    GETKEYYN;
+    if [ "$keypress" = "y" ]; then
+        sudo apt install $1 # can't be quoted so apt can proccess each package separetedly
+    fi
+else
+    printf " %-22s $green installed ${white}\n" "$2"
+fi
+}
+
+# Disk mount 
+CHKINST "udisks2" "udisksctl"
+CHKINST "lvm2" "vgchange"
+CHKINST "cryptsetup" "cryptsetup"
+
+if [ "$1" = "mount" ]; then
+    blocksavailable="$(lsblk -l | sed 's/ /\n/g' | grep -Ew 'sd[b|c|d|e|f|g][1-9]|sr[0-3]')"
+    mountedpaths=
+    if [ "$blocksavailable" ]; then
+        for dev in $blocksavailable ; do
+			# Check if it is not mounted
+			if [ ! "$(mount | grep "/dev/$dev")" ]; then 
+				printf "Checking if %s is encrypted: " "$dev"
+				if [ "$(sudo blkid /dev/$dev | grep -i "luks")" ]; then 
+					printf "yes.\n"
+
+					uuid="$(blkid /dev/$dev | sed 's/.* UUID="// ; s/" .*//')"
+					printf "Cheking if %s is already mounted: " "$uuid"
+						if [ ! "$(mount | grep "$uuid")" ]; then 
+							printf "no.\n"
+							echo "Unlocking $dev "
+							udisksctl unlock -b /dev/$dev
+
+							# Useful command: 
+							# lvscan
+							#
+							# Activate lvm
+							# https://www.linuxdescomplicado.com.br/2019/06/saiba-como-montar-uma-particao-com-disco-lvm-configurado.html
+							if [ "$(sudo lvscan | grep -i "inactive")" ]; then 
+								sudo vgchange -ay 
+							fi
+
+							mapped="$(lsblk -p | grep -A 4 "/dev/$dev" | grep "mapper" | grep 'vg-root' | sed 's|.*\(/dev/\)|\1| ; s/ .*//')"
+							[ ! "$mapped" ] && mapped="$(lsblk -p | grep -A 4 "/dev/$dev" | grep "mapper" | sed 's|.*\(/dev/\)|\1| ; s/ .*//')"
+							if [ "$mapped" ]; then 
+								echo "Mounting $mapped"
+								curmountpath="$(udisksctl mount -b "$mapped" | awk '{ print $4}')"
+								mountedpaths="${mountedpaths}\n$curmountpath"
+							#	udisksctl mount -b "$mapped"
+							#	mountedpaths="${mountedpaths}\n$mapped"
+
+							else
+								echo "Failed to find unlocked partition :-( "
+							fi
+						else
+							printf "yes.\n"
+							curmountpath="$(mount | grep "$uuid" | awk '{ print $3 }')"
+							mountedpaths="${mountedpaths}\n$curmountpath"
+						fi
+				else
+					printf "no.\n"
+	            	echo "Mounting $dev "
+	            	#udisksctl mount -b /dev/$dev
+					curmountpath="$(udisksctl mount -b "/dev/$dev" | awk '{ print $4}')"
+					mountedpaths="${mountedpaths}\n$curmountpath"
+				fi
+			else
+				echo "$dev already mounted"
+			fi
+        done
+		echo 
+		echo "=================================================="
+		echo 
+		echo "Mounted paths: "
+		printf "$mountedpaths"
+		echo
+		echo
+		echo "=================================================="
+    else
+        echo "No device found."
+    fi
+    exit 0
+fi
+
+if [ "$1" = "unmount" ]; then
+#    blocksmounted="$(lsblk -l | grep 'media' | sed 's/ /\n/g' | grep -Ew 'sd[b|c|d][1-9]')"
+#    grep -v 'sda' probably isn't needed because we first grep 'media' but better safe than sorry :-) 
+    #blocksmounted="$(lsblk -l | grep 'media' | sed 's/ .*//' | grep -v 'sda')" 
+
+	# Encrypted Devices
+    blocksmountedenc="$(find /dev/mapper/* | grep -v "control")" 
+    if [ "$blocksmountedenc" ]; then
+		# First loop: lock all blocks
+        for dev in $blocksmountedenc ; do
+			echo "Unmounting encrypted $dev "
+			udisksctl unmount -b "$dev"
+
+			echo "Locking $dev"
+			sudo cryptsetup luksClose "$dev"
+        done
+    fi
+
+	# Unencrypted Devices
+	empty="$(find /media/desgua -maxdepth 0 -empty -exec echo {} is empty. \;)"
+
+	if [ ! "$empty" ]; then
+		blocksmounted="$(find /media/desgua/* -maxdepth 0)" 
+	    if [ "$blocksmounted" ]; then
+		    for dev in $blocksmounted ; do
+				devsdname="$(lsblk -l -f | grep "$dev" | awk '{ print $1 }')"
+				echo "Unmounting $devsdname"
+				udisksctl unmount -b "/dev/$devsdname"
+		
+				echo "Powering Off $devsdname"
+				udisksctl power-off -b "/dev/$devsdname"
+			done
+		fi
+	fi
+
+    if [ "$blocksmountedenc" ]; then
+		# Second loop: turn device off
+        for dev in $blocksmountedenc ; do
+#			devunlocked="$(lsblk | grep -B 1 "$dev" | head -n 1 | grep -o "sd..")"
+#			[ ! "$devunlocked" ] && devunlocked="$(lsblk | grep -B 2 "$dev" | head -n 1 | grep -o "sd..")"
+			devid="$(printf "%s" "$dev" | sed 's|/dev/mapper/luks-||')"
+			devsdname="$(lsblk -l -f | grep "$name" | grep "crypto_LUKS" | awk '{ print $1 }')"
+			if [ "$devsdname" ]; then 
+				echo "Powering Off $devsdname"
+				udisksctl power-off -b "/dev/$devsdname"
+			fi
+		done
+    fi
+
+	# Cdrom
+	udisksctl unmount -b "/dev/cdrom" >/dev/null 2>&1
+
+    exit 0
+fi
+
+echo "This script will detect and mount or unmount removable devices."
+echo "Usage $(basename $0) [mount|unmount]"
+exit 0
